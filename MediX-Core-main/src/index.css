@@ -1,0 +1,94 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --color-primary: 21 126 105;      /* hospital-600 */
+    --color-primary-dark: 17 101 86;  /* hospital-700 */
+    --color-accent: 231 159 30;       /* accent-500 */
+  }
+
+  body {
+    @apply antialiased bg-ink-50 text-ink-900 dark:bg-ink-950 dark:text-ink-100;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+
+  h1, h2, h3, h4 {
+    @apply font-display tracking-tight;
+  }
+}
+
+/* Custom Scrollbars */
+::-webkit-scrollbar {
+  width: 7px;
+  height: 7px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  @apply bg-ink-200 dark:bg-ink-700 rounded-full transition-colors;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-ink-300 dark:bg-ink-600;
+}
+
+/* Panels: menos "vidrio genérico", más plano con acento de borde a la izquierda */
+.glass-panel {
+  @apply bg-white/90 dark:bg-ink-900/90 backdrop-blur-md border border-ink-200/70 dark:border-ink-800/70 shadow-sm;
+}
+
+.glass-card {
+  @apply bg-white dark:bg-ink-900 border border-ink-200/80 dark:border-ink-800 rounded-xl2 shadow-card hover:shadow-card-hover transition-all duration-200;
+}
+
+.accent-rule {
+  @apply border-l-4 border-accent-500;
+}
+
+/* Pulse animation for active calling turn */
+@keyframes pulse-ring {
+  0% {
+    transform: scale(0.95);
+    box-shadow: 0 0 0 0 rgba(21, 126, 105, 0.7);
+  }
+  70% {
+    transform: scale(1);
+    box-shadow: 0 0 0 16px rgba(21, 126, 105, 0);
+  }
+  100% {
+    transform: scale(0.95);
+    box-shadow: 0 0 0 0 rgba(21, 126, 105, 0);
+  }
+}
+
+.calling-pulse {
+  animation: pulse-ring 2s infinite cubic-bezier(0.4, 0, 0.6, 1);
+}
+
+/* Print Styles */
+@media print {
+  body * {
+    visibility: hidden;
+  }
+  .printable-area, .printable-area * {
+    visibility: visible;
+  }
+  .printable-area {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    margin: 0;
+    padding: 20px;
+    background: white !important;
+    color: black !important;
+  }
+  .no-print {
+    display: none !important;
+  }
+}

@@ -1,0 +1,6 @@
+node_modules/
+MediX-Core-main/node_modules/
+backend/node_modules/
+.env
+dist/
+MediX-Core-main/dist-electron/
