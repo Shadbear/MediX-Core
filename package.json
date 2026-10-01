@@ -1,0 +1,24 @@
+{
+  "name": "medix-core",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Sistema hospitalario simple y seguro: Node + SQLite, sin servidor de base de datos.",
+  "main": "server.js",
+  "engines": {
+    "node": ">=20.12"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test test/*.test.js",
+    "reset-password": "node scripts/reset-password.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "better-sqlite3": "^13.0.3",
+    "express": "^5.2.1",
+    "express-rate-limit": "^8.7.0",
+    "helmet": "^8.3.0",
+    "zod": "^3.25.76"
+  }
+}
