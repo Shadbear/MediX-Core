@@ -1,4 +1,4 @@
-<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MediX-Core · Hospital</title>
+<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MediX-Core · Hospital</title><link rel="icon" href="data:,">
 <style>
 :root{--navy:#082f49;--teal:#0d9488;--teal2:#14b8a6;--bg:#eef6f8;--card:#fff;--tx:#12303f;--mut:#5b7685;--red:#e11d48;--org:#f59e0b;--grn:#16a34a}
 *{box-sizing:border-box}body{margin:0;font:15px/1.45 system-ui,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--tx);display:flex;min-height:100vh}
@@ -113,5 +113,5 @@ document.addEventListener('submit',async e=>{e.preventDefault();const k=e.target
 setInterval(()=>{$('#clk').textContent=new Date().toLocaleString('es-PE',{dateStyle:'full',timeStyle:'short'})},1000);
 setInterval(async()=>{const x=document.activeElement;if(x&&/INPUT|SELECT|TEXTAREA/.test(x.tagName))return;try{S=await api('GET','');announce();draw()}catch{}},4000);
 setInterval(()=>{const h=HM();(S.recetas||[]).forEach(r=>{const k=r.id+HOY()+h;if(r.hora==h&&!alerted[k]){alerted[k]=1;toast(`💊 ${r.paciente}: tomar ${r.medicamento} ${r.dosis||''}`);beep(3)}})},15000);
-load();
+load().catch(()=>{});
 </script></body></html>
