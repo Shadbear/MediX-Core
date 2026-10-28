@@ -1,0 +1,490 @@
+diff --git a/lib/agenda.js b/lib/agenda.js
+new file mode 100644
+index 0000000..8b69ce4
+--- /dev/null
++++ b/lib/agenda.js
+@@ -0,0 +1,148 @@
++'use strict';
++/* Programación de médicos, cupos y franjas horarias.
++   Sin base de datos: opera sobre el objeto `db` en memoria de server.js
++   (db.programacion = turnos de los médicos, db.citas = citas asignadas). */
++
++const pad = (n) => String(n).padStart(2, '0');
++const toMin = (h) => { const [a, b] = h.split(':'); return Number(a) * 60 + Number(b); };
++const toHM = (m) => `${pad(Math.floor(m / 60))}:${pad(m % 60)}`;
++
++const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
++const MONTH_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
++const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
++const DIAS_RE = /^[0-6](,[0-6])*$/; // 0 = domingo ... 6 = sábado
++const SEGUROS = ['SIS', 'EsSalud', 'Particular', 'Otro'];
++
++function validDate(s) {
++  if (typeof s !== 'string' || !DATE_RE.test(s)) return false;
++  const d = new Date(`${s}T00:00:00Z`);
++  return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s;
++}
++const validMonth = (s) => typeof s === 'string' && MONTH_RE.test(s);
++const weekday = (s) => new Date(`${s}T00:00:00Z`).getUTCDay();
++const addDays = (s, n) => new Date(Date.parse(`${s}T00:00:00Z`) + n * 864e5).toISOString().slice(0, 10);
++
++/** Fecha y hora locales del servidor: { fecha: 'AAAA-MM-DD', hora: 'HH:MM' }. */
++function localNow(t = Date.now()) {
++  const iso = new Date(t - new Date(t).getTimezoneOffset() * 6e4).toISOString();
++  return { fecha: iso.slice(0, 10), hora: iso.slice(11, 16) };
++}
++
++const diasDe = (p) => String(p.dias ?? '').split(',').filter(Boolean).map(Number);
++const atiende = (p, fecha) => validDate(fecha) && diasDe(p).includes(weekday(fecha));
++
++/** Franjas del turno: [{hi, hf}] cada `dur` minutos. */
++function slotsDe(p) {
++  const out = [];
++  const dur = Number(p.dur);
++  if (!TIME_RE.test(p.hi) || !TIME_RE.test(p.hf) || !(dur > 0)) return out;
++  for (let m = toMin(p.hi); m + dur <= toMin(p.hf); m += dur) out.push({ hi: toHM(m), hf: toHM(m + dur) });
++  return out;
++}
++
++const activas = (db, p, fecha) => db.citas.filter((c) => c.fecha === fecha && c.medico === p.medico && c.estado !== 'Cancelada');
++const vencida = (fecha, slot, now) => fecha < now.fecha || (fecha === now.fecha && slot.hf <= now.hora);
++
++/** Franjas de un médico en una fecha, con su estado: Disponible / Ocupado / Vencido. */
++function franjas(db, p, fecha, now = localNow()) {
++  if (!atiende(p, fecha)) return { laborable: false, franjas: [], total: 0, libres: 0 };
++  const citas = activas(db, p, fecha);
++  const lista = slotsDe(p).map((s, i) => {
++    const c = citas.find((x) => x.hora === s.hi);
++    const venc = vencida(fecha, s, now);
++    return {
++      n: i + 1, hi: s.hi, hf: s.hf, vencido: venc,
++      estado: c ? 'Ocupado' : venc ? 'Vencido' : 'Disponible',
++      cita: c ? { id: c.id, paciente: c.paciente, dni: c.dni || '', cuenta: c.cuenta ?? null, estado: c.estado } : null,
++    };
++  });
++  return { laborable: true, franjas: lista, total: lista.length, libres: lista.filter((f) => f.estado === 'Disponible').length };
++}
++
++/** Calendario mensual: { 'AAAA-MM-DD': { total, libres, ocupados } } solo para días programados. */
++function calendario(db, p, mes, now = localNow()) {
++  const [y, m] = mes.split('-').map(Number);
++  const n = new Date(Date.UTC(y, m, 0)).getUTCDate();
++  const dias = {};
++  for (let d = 1; d <= n; d++) {
++    const f = `${mes}-${pad(d)}`;
++    if (!atiende(p, f)) continue;
++    const r = franjas(db, p, f, now);
++    dias[f] = { total: r.total, libres: r.libres, ocupados: r.franjas.filter((x) => x.estado === 'Ocupado').length };
++  }
++  return dias;
++}
++
++/** Primer cupo libre (fecha y hora más próximas) entre las programaciones dadas. */
++function proximo(db, progs, now = localNow(), horizonte = 120) {
++  let best = null;
++  for (const p of progs) {
++    for (let i = 0; i <= horizonte; i++) {
++      const f = addDays(now.fecha, i);
++      if (best && f > best.fecha) break;
++      if (!atiende(p, f)) continue;
++      const s = franjas(db, p, f, now).franjas.find((x) => x.estado === 'Disponible');
++      if (!s) continue;
++      if (!best || f < best.fecha || (f === best.fecha && s.hi < best.hi)) best = { prog: p.id, fecha: f, hi: s.hi, hf: s.hf };
++      break;
++    }
++  }
++  return best;
++}
++
++/** Valida una cita ligada a una programación. Devuelve un mensaje de error o null. */
++function validarCita(db, o, id, now = localNow(), { past = true } = {}) {
++  if (!o.prog) return null; // cita antigua, sin programación
++  const p = db.programacion.find((x) => x.id === o.prog);
++  if (!p) return 'La programación indicada no existe';
++  if (o.medico !== p.medico) return 'El médico no corresponde a la programación';
++  if (!atiende(p, o.fecha)) return 'El médico no atiende ese día';
++  const s = slotsDe(p).find((x) => x.hi === o.hora);
++  if (!s) return 'La hora no corresponde a una franja programada';
++  if (past && vencida(o.fecha, s, now)) return 'La franja horaria ya venció';
++  if (o.dni && db.citas.some((c) => c.id !== id && c.estado !== 'Cancelada' && c.dni === o.dni && c.fecha === o.fecha && c.hora === o.hora)) {
++    return 'El paciente ya tiene una cita en ese horario';
++  }
++  return null;
++}
++
++/** Valida una programación de médico. Devuelve un mensaje de error o null. */
++function validarProgramacion(o) {
++  if (typeof o.medico !== 'string' || o.medico.trim().length < 3) return 'Indica el nombre del médico';
++  if (typeof o.especialidad !== 'string' || !o.especialidad.trim()) return 'Indica la especialidad';
++  if (typeof o.consultorio !== 'string' || !o.consultorio.trim()) return 'Indica el consultorio';
++  if (!TIME_RE.test(o.hi) || !TIME_RE.test(o.hf)) return 'Horas con formato HH:MM';
++  if (toMin(o.hf) <= toMin(o.hi)) return 'La hora de fin debe ser posterior al inicio';
++  if (!Number.isInteger(o.dur) || o.dur < 5 || o.dur > 120) return 'La duración por cita debe ser de 5 a 120 minutos';
++  if (toMin(o.hf) - toMin(o.hi) < o.dur) return 'El turno es más corto que la duración de una cita';
++  if (typeof o.dias !== 'string' || !DIAS_RE.test(o.dias)) return 'Selecciona al menos un día de atención';
++  return null;
++}
++
++/** Asigna un cupo a un paciente. Devuelve { cita } o { error, status }. */
++function asignar(db, b, { id, now = localNow() }) {
++  const p = db.programacion.find((x) => x.id === b.prog);
++  if (!p) return { error: 'Selecciona un médico programado', status: 404 };
++  // Si viene `pid`, el paciente sale del registro de pacientes (con su historia clínica).
++  const pac = b.pid ? (db.pacientes || []).find((x) => x.id === b.pid) : null;
++  if (b.pid && !pac) return { error: 'Paciente no encontrado', status: 404 };
++  const paciente = pac ? `${pac.apellidos}, ${pac.nombres}`.slice(0, 100) : String(b.paciente ?? '').trim().slice(0, 100);
++  const dni = pac ? pac.dni : String(b.dni ?? '').trim().toUpperCase();
++  if (paciente.length < 3) return { error: 'Ingresa el nombre del paciente', status: 400 };
++  if (!/^[A-Z0-9]{8,12}$/.test(dni)) return { error: 'El documento debe tener entre 8 y 12 letras o números', status: 400 };
++  if (!SEGUROS.includes(b.seguro)) return { error: 'Selecciona el tipo de seguro', status: 400 };
++  if (!validDate(b.fecha)) return { error: 'Fecha inválida', status: 400 };
++  if (typeof b.hora !== 'string' || !TIME_RE.test(b.hora)) return { error: 'Hora inválida', status: 400 };
++
++  const o = { prog: p.id, medico: p.medico, consultorio: p.consultorio, especialidad: p.especialidad, fecha: b.fecha, hora: b.hora, paciente, dni, seguro: b.seguro, estado: 'Programada', ...(pac ? { pid: pac.id, hc: pac.hc } : {}) };
++  let error = validarCita(db, o, null, now);
++  if (!error && db.citas.some((c) => c.estado !== 'Cancelada' && c.medico === o.medico && c.fecha === o.fecha && c.hora === o.hora)) error = 'Ese cupo ya fue asignado';
++  if (error) return { error, status: 409 };
++
++  db.meta.cuenta = (db.meta.cuenta ?? 1000) + 1; // N° de cuenta correlativo
++  const cita = { ...o, cuenta: db.meta.cuenta, id, ts: Date.now() };
++  db.citas.push(cita);
++  return { cita };
++}
++
++module.exports = { localNow, validDate, validMonth, slotsDe, franjas, calendario, proximo, validarCita, validarProgramacion, asignar, SEGUROS };
+diff --git a/public/index.html b/public/index.html
+index a42cca6..fde1f8d 100644
+--- a/public/index.html
++++ b/public/index.html
+@@ -28,6 +28,21 @@ table{width:100%;border-collapse:collapse;font-size:14px}th{text-align:left;colo
+ #scr .n{font-size:min(22vw,200px);font-weight:900;color:var(--teal2);line-height:1}#scr .q span{display:inline-block;margin:6px;padding:8px 18px;background:#ffffff1f;border-radius:10px;font-size:24px}
+ #toast{position:fixed;right:16px;bottom:16px;z-index:99;display:grid;gap:8px}#toast div{background:var(--navy);color:#fff;padding:12px 16px;border-radius:10px;box-shadow:0 4px 16px #0006;animation:in .3s}#toast .err{background:var(--red)}
+ #login{position:fixed;inset:0;z-index:100;background:linear-gradient(135deg,var(--navy),var(--teal));display:flex;align-items:center;justify-content:center}#login form{background:#fff;padding:28px;border-radius:16px;width:min(360px,92vw);box-shadow:0 10px 40px #0007}#login h2{margin:0 0 14px}
++.mut{color:var(--mut)}
++.adm{display:grid;gap:14px;grid-template-columns:minmax(250px,1fr) minmax(230px,300px) minmax(300px,1.3fr);align-items:start}
++@media(max-width:1100px){.adm{grid-template-columns:1fr}}
++.flt{display:grid;gap:6px}.flt2{display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));align-items:end}
++.pr{display:block;width:100%;text-align:left;border:1px solid #c5d9e0;background:#fff;border-radius:8px;padding:7px 9px;margin:4px 0;font:inherit;cursor:pointer;transition:.2s}.pr small{display:block;color:var(--mut)}.pr:hover{border-color:var(--teal)}.pr.sel{background:#ccfbf1;border-color:var(--teal)}
++.slot{display:block;width:100%;text-align:left;border:1px solid #bbf7d0;border-left:5px solid var(--grn);border-radius:6px;padding:6px 9px;margin:3px 0;font:inherit;background:#f0fdf4}
++button.slot{cursor:pointer}button.slot:hover,.slot.sel{background:#bbf7d0}.slot em{float:right;font-style:normal;color:var(--mut);font-size:13px}
++.slot.Ocupado{background:#ede9fe;border-color:#c4b5fd;border-left-color:#7c3aed}.slot.Vencido{background:#f1f5f9;border-color:#e2e8f0;border-left-color:#94a3b8;color:#94a3b8}
++.cal{display:grid;grid-template-columns:repeat(7,1fr);gap:3px}.ch{text-align:center;font-size:12px;color:var(--mut);font-weight:700}
++.cd{min-height:44px;border-radius:6px;border:1px solid #e3eef2;padding:3px 5px;font:inherit;text-align:left;background:#fff;display:block}.cd small{display:block;font-size:11px;color:var(--mut)}
++.cd.off{background:#f4f8fa;color:#a8bcc5}button.cd.on{cursor:pointer;border-color:var(--teal2);background:#f0fdfa}button.cd.full{background:#fef2f2;border-color:#fecaca}button.cd.sel,.cd.sel{background:var(--teal);color:#fff;border-color:var(--teal)}.cd.sel small{color:#e6fffb}button.cd.past{background:#f4f8fa;border-color:#e3eef2;color:#8aa1ab}.cd.hoy{outline:2px solid var(--org)}
++.calh{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
++.stat{display:flex;gap:16px;flex-wrap:wrap;margin:0 0 6px}.quedan{color:var(--red);font-weight:800}
++.rxp{border:1px dashed #94a3b8;padding:16px;border-radius:10px;background:#fff}
++@media print{body *{visibility:hidden}#rxp,#rxp *{visibility:visible}#rxp{position:absolute;left:0;top:0;width:100%;border:0}}
+ @media(max-width:800px){body{display:block}nav{width:100%;height:auto;position:static;display:flex;flex-wrap:wrap}nav h6{width:100%}nav button{width:auto}}
+ </style></head><body>
+ <nav id="nav"></nav><main><header><div><h1 id="ttl"></h1><small id="clk"></small></div><div style="position:relative"><span id="who"></span> <button class="btn s g" data-a="logout">Salir</button></div><svg class="ecg" viewBox="0 0 600 60" preserveAspectRatio="none"><polyline points="0,30 120,30 140,30 155,6 170,54 185,30 300,30 320,30 335,6 350,54 365,30 480,30 500,30 515,6 530,54 545,30 600,30"/></svg></header><div id="v"></div></main>
+@@ -38,7 +53,7 @@ const HOY=()=>new Date(Date.now()-new Date().getTimezoneOffset()*6e4).toISOStrin
+ let S={},tab='inicio',tri=null,scr=false,snd=false,last=null,alerted={},ac;
+ const SALAS=['Sala de reuniones 1','Sala de reuniones 2','Pabellón quirúrgico A','Pabellón quirúrgico B'];
+ async function api(m,p,b){const r=await fetch('/api'+p,{method:m,headers:{'Content-Type':'application/json','X-Requested-With':'medix'},body:b?JSON.stringify(b):void 0}),j=await r.json();if(r.status==401&&p!=='/auth/login'){$('#login').style.display='flex';throw 0}if(!r.ok){toast(j.error||'Error','err');throw 0}return j}
+-const load=async()=>{const m=await api('GET','/auth/me');S=await api('GET','');$('#login').style.display='none';$('#who').textContent=m.u+' · '+m.role;draw()};
++const load=async()=>{const m=await api('GET','/auth/me');ROLE=m.role;S=await api('GET','');if(tab=='admision')await refreshAD();$('#login').style.display='none';$('#who').textContent=m.u+' · '+m.role;draw()};
+ function toast(t,c=''){const d=document.createElement('div');d.className=c;d.textContent=t;$('#toast').append(d);setTimeout(()=>d.remove(),5000)}
+ function beep(n=2){if(!ac)return;for(let i=0;i<n;i++){const o=ac.createOscillator(),g=ac.createGain();o.connect(g);g.connect(ac.destination);o.frequency.value=880;g.gain.setValueAtTime(.3,ac.currentTime+i*.4);g.gain.exponentialRampToValueAtTime(.001,ac.currentTime+i*.4+.3);o.start(ac.currentTime+i*.4);o.stop(ac.currentTime+i*.4+.3)}}
+ const f=(l,n,t='text',x='')=>`<label>${l}<input name="${n}" type="${t}" ${x}></label>`,
+@@ -50,7 +65,7 @@ tag=(t,c='')=>`<span class="tag ${c}">${esc(t)}</span>`,
+ card=(t,h)=>`<div class="card"><h3>${t}</h3>${h}</div>`,
+ docs=()=>S.directorio.filter(d=>!/enfermer/i.test(d.especialidad)).map(d=>d.nombre);
+ const SINT=[['Dolor de pecho',5],['Dificultad para respirar',5],['Pérdida de conciencia',5],['Sangrado abundante',4],['Fiebre alta (>39 °C)',3],['Dolor intenso',3],['Vómitos o diarrea',2],['Tos persistente',1],['Dolor de cabeza',1],['Malestar leve',1]];
+-const NAV=[['inicio','🏥','Panel general'],['Atención'],['triaje','🩺','Triaje digital'],['citas','📅','Agendamiento'],['turnos','🔔','Turnos'],['recetas','💊','Recordatorio recetas'],['Logística'],['stock','📦','Stock médico'],['equipos','🔬','Rastreador equipos'],['camas','🛏️','Gestión de camas'],['Administración'],['visitas','🚪','Registro de visitas'],['asistencia','🪪','Control asistencia'],['encuestas','⭐','Encuestas'],['salas','🏢','Reserva de salas'],['Soporte clínico'],['calc','🧮','Calculadoras'],['dir','📇','Directorio']];
++const NAV=[['inicio','🏥','Panel general'],['Consulta externa'],['paciente','🧑','Paciente'],['admision','🗓️','Citas y admisión'],['trajereg','🩺','Registro de triaje'],['atenc','📝','Registro de atenciones'],['rx','💊','Recetas'],['Programación'],['prog','👩‍⚕️','Programación de médicos'],['Atención'],['triaje','🩺','Triaje digital (autoevaluación)'],['turnos','🔔','Turnos'],['recetas','💊','Recordatorio de tomas'],['Logística'],['stock','📦','Stock médico'],['equipos','🔬','Rastreador equipos'],['camas','🛏️','Gestión de camas'],['Administración'],['visitas','🚪','Registro de visitas'],['asistencia','🪪','Control asistencia'],['encuestas','⭐','Encuestas'],['salas','🏢','Reserva de salas'],['Soporte clínico'],['calc','🧮','Calculadoras'],['dir','📇','Directorio']];
+ const V={
+ inicio:()=>{const lib=S.camas.filter(c=>c.estado=='Libre').length,bajo=S.stock.filter(s=>s.cantidad<=s.minimo).length,k=(n,l,c='')=>`<div class="card kpi" style="${c}"><b>${n}</b><span>${l}</span></div>`;
+  const prom=S.encuestas.length?(S.encuestas.reduce((a,e)=>a+ +e.nota,0)/S.encuestas.length).toFixed(1):'–';
+@@ -58,8 +73,6 @@ inicio:()=>{const lib=S.camas.filter(c=>c.estado=='Libre').length,bajo=S.stock.f
+  ${card('Últimos triajes',tbl(['Paciente','Nivel','Puntaje'],S.triajes.slice(-5).reverse().map(t=>tr([esc(t.nombre),tag(t.nivel,t.c),t.puntos]))))}`},
+ triaje:()=>`<div class="grid two">${card('Autoevaluación de síntomas',`<form data-f="triaje">${f('Nombre','nombre','text','required')}${f('Edad','edad','number','required min=0')}<p>Marca tus síntomas:</p>${SINT.map(([s,w])=>`<label class="chk"><input type="checkbox" name="s" value="${w}">${s}</label>`).join('')}<button class="btn">Evaluar gravedad</button></form>`)}
+  <div>${tri?`<div class="res ${tri.c}"><h2 style="margin:0">${tri.nivel}</h2>${tri.msg}</div>`:card('Resultado','Completa el formulario para conocer tu nivel de prioridad. <br><small>Es una orientación, no un diagnóstico.</small>')}</div></div>`,
+-citas:()=>`<div class="grid two">${card('Reservar cita',`<form data-f="cita">${f('Paciente','paciente','text','required')}${sel('Médico','medico',docs())}${f('Fecha','fecha','date',`required min="${HOY()}" value="${HOY()}"`)}${f('Hora','hora','time','required')}<button class="btn">Reservar</button></form>`)}
+- ${card('Citas',tbl(['Paciente','Médico','Fecha','Hora','Estado',''],[...S.citas].sort((a,b)=>(a.fecha+a.hora).localeCompare(b.fecha+b.hora)).map(c=>tr([esc(c.paciente),esc(c.medico),c.fecha,c.hora,tag(c.estado,c.estado=='Cancelada'?'r':''),c.estado=='Cancelada'?'':b('reprog',c.id,'Reprogramar','o')+' '+b('cancel',c.id,'Cancelar','r')])))) }</div>`,
+ turnos:()=>`<div class="grid two">${card('Emisión de turnos',`<form data-f="turno">${f('Paciente','paciente','text','required')}${sel('Área','area',['Medicina general','Emergencias','Pediatría','Laboratorio'])}<button class="btn">Generar turno</button></form><hr><button class="btn" data-a="next">📢 Llamar siguiente</button> <button class="btn g" data-a="screen">🖥️ Abrir pantalla de sala de espera</button>`)}
+  ${card('Cola',tbl(['Turno','Paciente','Área','Estado'],S.turnos.filter(t=>t.estado!='atendido').map(t=>tr([`<b>${t.num}</b>`,esc(t.paciente),esc(t.area),tag(t.estado,t.estado=='llamado'?'r':'b')]))))}</div>`,
+ recetas:()=>`<div class="grid two">${card('Nuevo recordatorio',`<form data-f="receta">${f('Paciente','paciente','text','required')}${f('WhatsApp (con código país)','tel','tel','required placeholder="51999999999"')}${f('Medicamento','medicamento','text','required')}${f('Dosis','dosis')}${f('Hora diaria','hora','time','required')}<button class="btn">Guardar</button></form>`)}
+@@ -83,7 +96,7 @@ dir:()=>`<div class="card"><h3>Directorio médico</h3><input id="q" placeholder=
+ };
+ const T=t=>NAV.find(n=>n[0]==t)[2]||'';
+ function draw(){$('#nav').innerHTML='<div class="logo"><i>✚</i>MediX-Core</div>'+NAV.map(n=>n[1]?`<button class="${n[0]==tab?'on':''}" data-a="tab" data-id="${n[0]}">${n[1]} ${n[2]}</button>`:`<h6>${n[0]}</h6>`).join('');
+- $('#ttl').textContent=T(tab);$('#v').innerHTML=V[tab]();if(tab=='dir')dirList();screen()}
++ $('#ttl').textContent=T(tab);$('#v').innerHTML=V[tab]();if(tab=='dir')dirList();if(tab=='paciente')pacList();screen()}
+ function dirList(){const q=($('#q').value||'').toLowerCase();$('#dl2').innerHTML=tbl(['Nombre','Especialidad','Anexo','Correo'],S.directorio.filter(d=>JSON.stringify(d).toLowerCase().includes(q)).map(d=>tr([`<b>${esc(d.nombre)}</b>`,esc(d.especialidad),'📞 '+esc(d.anexo),`<a href="mailto:${esc(d.correo)}">${esc(d.correo)}</a>`])))}
+ function screen(){const s=$('#scr');s.style.display=scr?'flex':'none';if(!scr)return;const c=S.turnos.find(t=>t.estado=='llamado'),w=S.turnos.filter(t=>t.estado=='espera').slice(0,5);
+  s.innerHTML=`<h2>TURNO ACTUAL</h2><div class="n">${c?c.num:'—'}</div><h2>${c?esc(c.paciente)+' · Módulo '+esc(c.modulo):'Esperando…'}</h2><div class="q">${w.map(t=>`<span>${t.num}</span>`).join('')}</div><p><button class="btn g" data-a="screen">Cerrar</button></p>`}
+@@ -92,7 +105,7 @@ const F={login:async d=>{await api('POST','/auth/login',{u:d.u,p:d.p})},
+ triaje:async(d,e)=>{const p=[...e.target.querySelectorAll('[name=s]:checked')].reduce((a,x)=>a+ +x.value,0);
+  tri=p>=5?{c:'r',nivel:'EMERGENCIA',msg:'Acude a urgencias de inmediato o llama al 116/106.'}:p>=3?{c:'o',nivel:'URGENTE',msg:'Necesitas atención el mismo día. Dirígete a urgencias.'}:p>=1?{c:'g',nivel:'LEVE',msg:'Puedes agendar una cita con medicina general.'}:{c:'g',nivel:'SIN SÍNTOMAS',msg:'No marcaste síntomas.'};
+  await api('POST','/triajes',{nombre:d.nombre,edad:d.edad,puntos:p,nivel:tri.nivel,c:tri.c})},
+-cita:d=>api('POST','/citas',{...d,estado:'Programada'}),turno:d=>api('POST','/turnos',d),receta:d=>api('POST','/recetas',d),
++turno:d=>api('POST','/turnos',d),receta:d=>api('POST','/recetas',d),
+ insumo:d=>api('POST','/stock',{...d,cantidad:+d.cantidad,minimo:+d.minimo}),equipo:d=>api('POST','/equipos',{...d,asignado:'Sin asignar'}),
+ asig:async d=>{const q=S.equipos.find(x=>x.codigo.toLowerCase()==d.codigo.trim().toLowerCase());if(!q){toast('Código no registrado','err');throw 0}await api('PUT','/equipos/'+q.id,{asignado:d.asignado});toast(q.nombre+' → '+d.asignado)},
+ visita:d=>api('POST','/visitas',d),encuesta:async d=>{if(!sessionStorage.nota){toast('Elige una calificación','err');throw 0}await api('POST','/encuestas',{...d,nota:+sessionStorage.nota});sessionStorage.removeItem('nota');toast('¡Gracias por tu opinión!')},
+@@ -106,12 +119,142 @@ cancel:id=>api('PUT','/citas/'+id,{estado:'Cancelada'}),reprog:id=>{const fe=pro
+ in:id=>mov(id,1),out:id=>mov(id,-1),bed:(id,v)=>api('PUT','/camas/'+id,{estado:v,paciente:v=='Ocupada'?prompt('Nombre del paciente:')||'Paciente':''}),
+ exit:id=>api('PUT','/visitas/'+id,{salida:HM()}),star:(_,v)=>{sessionStorage.nota=v;$('#nt').textContent='Calificación: '+v+'/5'},q:dirList};
+ const mov=(id,s)=>{const n=+prompt(s>0?'Cantidad que ingresa:':'Cantidad que sale:','1');if(!n||n<0)return;const it=S.stock.find(x=>x.id==id);if(s<0&&n>it.cantidad){toast('No hay suficiente stock','err');return}return api('PUT','/stock/'+id,{cantidad:it.cantidad+s*n})};
++/* ===== Consulta externa (inspirado en GalenPlus): Paciente · Citas y admisión · Triaje · Atenciones · Recetas · Programación ===== */
++let ROLE='';
++const is=(...r)=>r.includes(ROLE);
++const SEG=['SIS','EsSalud','Particular','Otro'],DIAS=['Dom','Lun','Mar','Mié','Jue','Vie','Sáb'],MESES=['Enero','Febrero','Marzo','Abril','Mayo','Junio','Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre'];
++const PAC={q:'',edit:null},AD={prog:null,mes:HOY().slice(0,7),fecha:null,slot:null,cal:{},fr:null,fmed:'',fcons:''},TG={cuenta:null},ATN={q:{fecha:HOY()},rows:null,sel:null},RX={cuenta:null};
++const sv=(l,n,o,cur='',x='')=>`<label>${l}<select name="${n}" ${x}>${o.map(v=>{const[a,t]=Array.isArray(v)?v:[v,v];return`<option value="${esc(a)}" ${a==cur?'selected':''}>${esc(t)}</option>`}).join('')}</select></label>`,
++ta=(l,n,x='')=>`<label>${l}<textarea name="${n}" rows="3" ${x}></textarea></label>`,
++edad=n=>{if(!n)return'';const[y,m,d]=n.split('-').map(Number),t=new Date();let a=t.getFullYear()-y;if(t.getMonth()+1<m||(t.getMonth()+1==m&&t.getDate()<d))a--;return a},
++pacName=p=>`${p.apellidos}, ${p.nombres}`,
++cuentaDe=c=>S.citas.find(x=>x.cuenta!=null&&String(x.cuenta)===String(c)),
++pacDe=c=>{const x=cuentaDe(c);return x&&S.pacientes.find(p=>p.id===x.pid||p.dni===x.dni)},
++uniq=k=>[...new Set(S.programacion.map(p=>p[k]))].sort(),
++diasTxt=p=>p.dias.split(',').map(d=>DIAS[d]).join(' '),
++estTag=e=>tag(e,{Cancelada:'r',Atendida:'',Triada:'b',Admitida:'o'}[e]??'g'),
++sameC=(a,b)=>String(a)===String(b);
++
++/* ---------- Paciente ---------- */
++function pacList(){const q=PAC.q.toLowerCase(),el=$('#pt');if(!el)return;
++ const rows=S.pacientes.filter(p=>!q||`${p.dni} ${p.hc} ${p.apellidos} ${p.nombres}`.toLowerCase().includes(q));
++ el.innerHTML=tbl(['HC','DNI','Paciente','Edad','Sexo','Seguro','Teléfono',''],rows.slice(0,100).map(p=>tr([`<b>${esc(p.hc)}</b>`,esc(p.dni),esc(pacName(p)),edad(p.nacimiento),esc(p.sexo),tag(p.seguro,'b'),esc(p.telefono||''),b('pac:edit',p.id,'Editar')])))}
++
++/* ---------- Citas y admisión ---------- */
++async function refreshAD(){if(!AD.prog){AD.cal={};AD.fr=null;return}
++ try{AD.cal=(await api('GET',`/agenda/calendario?prog=${AD.prog}&mes=${AD.mes}`)).dias;
++  AD.fr=AD.fecha?await api('GET',`/agenda/franjas?prog=${AD.prog}&fecha=${AD.fecha}`):null}catch{}}
++function calHtml(){const[y,m]=AD.mes.split('-').map(Number),n=new Date(Date.UTC(y,m,0)).getUTCDate(),lead=(new Date(Date.UTC(y,m-1,1)).getUTCDay()+6)%7;
++ let c='';for(let i=0;i<lead;i++)c+='<span class="cd off"></span>';
++ for(let d=1;d<=n;d++){const f=`${AD.mes}-${String(d).padStart(2,'0')}`,x=AD.cal[f],k=['cd',x?'on':'off',x&&!x.libres&&f>=HOY()?'full':'',x&&f<HOY()?'past':'',f==AD.fecha?'sel':'',f==HOY()?'hoy':''].join(' ');
++  c+=x?`<button class="${k}" data-a="ad:dia" data-id="${f}">${d}<small>${x.libres}/${x.total}</small></button>`:`<span class="${k}">${d}</span>`}
++ return `<div class="calh"><button class="btn s g" data-a="ad:mes" data-id="-1">‹</button><b>${MESES[m-1]} ${y}</b><button class="btn s g" data-a="ad:mes" data-id="1">›</button></div><div class="cal">${['Lun','Mar','Mié','Jue','Vie','Sáb','Dom'].map(x=>`<span class="ch">${x}</span>`).join('')}${c}</div>`}
++function frHtml(){const fr=AD.fr;
++ if(!AD.prog)return'<p class="mut">Selecciona un médico programado.</p>';
++ if(!AD.fecha)return'<p class="mut">Selecciona un día del calendario.</p>';
++ if(!fr||!fr.laborable)return'<p class="mut">El médico no atiende ese día.</p>';
++ return fr.franjas.map(s=>{const n=String(s.n).padStart(2,'0'),lbl=s.estado=='Ocupado'?`Ocupado · ${esc(s.cita.paciente)} · Cta ${s.cita.cuenta}`:s.estado,k='slot '+s.estado+(AD.slot==s.hi?' sel':'');
++  return s.estado=='Disponible'?`<button class="${k}" data-a="ad:slot" data-id="${s.hi}"><b>${n}</b> ${s.hi} – ${s.hf} <em>${lbl}</em></button>`:`<div class="${k}"><b>${n}</b> ${s.hi} – ${s.hf} <em>${lbl}</em></div>`}).join('')}
++function admision(){
++ const lista=S.programacion.filter(p=>(!AD.fmed||p.medico===AD.fmed)&&(!AD.fcons||p.consultorio===AD.fcons)),p=S.programacion.find(x=>x.id===AD.prog),fr=AD.fr,
++ asig=fr&&fr.laborable?fr.franjas.filter(s=>s.estado=='Ocupado').length:0,libres=fr&&fr.laborable?fr.libres:0,
++ sl=fr&&AD.slot&&fr.franjas.find(s=>s.hi==AD.slot&&s.estado=='Disponible'),
++ dia=AD.prog&&AD.fecha?S.citas.filter(c=>c.prog===AD.prog&&c.fecha===AD.fecha&&c.estado!='Cancelada').sort((a,b)=>a.hora.localeCompare(b.hora)):[];
++ return `<div class="adm">
++ <div>${card('Filtros',`<div class="flt">${sv('Médico','fm',[['','Todos'],...uniq('medico')],AD.fmed,'data-c="ad:fmed"')}${sv('Consultorio','fc',[['','Todos'],...uniq('consultorio')],AD.fcons,'data-c="ad:fcons"')}<div>${b('ad:clear','','Limpiar','g')} ${b('ad:prox','','Cupo próximo')}</div></div>`)}
++ ${card('Médicos programados',lista.map(x=>`<button class="pr ${x.id==AD.prog?'sel':''}" data-a="ad:prog" data-id="${x.id}"><b>${esc(x.medico)}</b><small>${esc(x.especialidad)} · ${esc(x.consultorio)}</small><small>${x.hi}–${x.hf} · ${x.dur} min · ${diasTxt(x)}</small></button>`).join('')||'<p class="mut">Sin médicos programados.</p>')}</div>
++ ${card(AD.fecha?`Agenda · ${AD.fecha}`:'Agenda del día',frHtml())}
++ <div>${card(p?`${esc(p.medico)} · ${esc(p.especialidad)}`:'Calendario',calHtml())}
++ ${AD.prog&&AD.fecha&&fr&&fr.laborable?`<div class="card"><div class="stat"><span>Cupos asignados: <b>${asig}</b></span><span>Cupos libres: <b>${libres}</b></span></div><div class="quedan">QUEDAN ${libres} CUPOS</div></div>`:''}
++ ${sl?card(`Asignar cupo ${sl.hi} – ${sl.hf}`,`<form data-f="asignar"><label>Paciente (DNI o apellido)<input name="pac" list="dlp" required autocomplete="off" placeholder="Escribe y elige un paciente"></label><datalist id="dlp">${S.pacientes.map(x=>`<option value="${esc(x.dni)} · ${esc(pacName(x))}"></option>`).join('')}</datalist>${sv('Seguro','seguro',[['','Según el paciente'],...SEG])}<button class="btn">Asignar cita</button> <small>¿No está registrado? Créalo en <b>Paciente</b>.</small></form>`):''}
++ ${AD.prog&&AD.fecha?card('Pacientes del día',tbl(['Hora','Cuenta','Paciente','DNI','Seguro','Estado',''],dia.map(c=>tr([c.hora,`<b>${c.cuenta}</b>`,esc(c.paciente),esc(c.dni),esc(c.seguro||''),estTag(c.estado),(c.estado=='Programada'?b('ad:estado',c.id,'Admitir','','Admitida')+' ':'')+(['Programada','Admitida'].includes(c.estado)?b('ad:estado',c.id,'Cancelar','r','Cancelada'):'')])))):''}</div></div>`}
++
++/* ---------- Registro de triaje (signos vitales) ---------- */
++function triajeReg(){
++ const pend=S.citas.filter(c=>c.cuenta!=null&&c.fecha==HOY()&&['Programada','Admitida'].includes(c.estado)).sort((a,b)=>a.hora.localeCompare(b.hora)),c=TG.cuenta&&cuentaDe(TG.cuenta),
++ imc=s=>s.peso&&s.talla?(s.peso/((s.talla/100)**2)).toFixed(1):'–';
++ return `<div class="grid two">${card('Pacientes por triar (hoy)',tbl(['Hora','Cuenta','Paciente','Servicio','Estado',''],pend.map(x=>tr([x.hora,`<b>${x.cuenta}</b>`,esc(x.paciente),esc(x.especialidad),estTag(x.estado),b('tg:sel',x.cuenta,'Tomar signos')]))))}
++ ${card(c?`Signos vitales · Cta ${c.cuenta} · ${esc(c.paciente)}`:'Signos vitales',c?`<form data-f="signos">${f('Presión arterial (mmHg)','pa','text','placeholder="120/80"')}${f('Frecuencia cardiaca (lpm)','fc','number','min=20 max=300')}${f('Frecuencia respiratoria (rpm)','fr','number','min=4 max=80')}${f('Temperatura (°C)','temp','number','step=0.1 min=25 max=45')}${f('Saturación O₂ (%)','spo2','number','min=0 max=100')}${f('Peso (kg)','peso','number','step=0.1 min=0.3 max=500')}${f('Talla (cm)','talla','number','step=0.1 min=20 max=260')}<button class="btn">Guardar triaje</button></form>`:'<p class="mut">Elige un paciente de la lista.</p>')}</div>
++ ${card('Últimos triajes registrados',tbl(['Cuenta','Paciente','PA','FC','FR','T°','SpO₂','Peso','Talla','IMC','Por'],[...S.signos].reverse().slice(0,15).map(s=>{const x=cuentaDe(s.cuenta);return tr([s.cuenta,esc(x?x.paciente:''),esc(s.pa||'–'),s.fc??'–',s.fr??'–',s.temp??'–',s.spo2??'–',s.peso??'–',s.talla??'–',imc(s),esc(s.por||'')])})))}`}
++
++/* ---------- Registro de atenciones ---------- */
++async function buscar(){const p=new URLSearchParams();for(const[k,v]of Object.entries(ATN.q))if(v&&String(v).trim())p.set(k,String(v).trim());ATN.rows=await api('GET','/agenda/atenciones?'+p)}
++function atPanel(){const c=cuentaDe(ATN.sel);if(!c)return'';
++ const p=pacDe(c.cuenta)||{},sg=[...S.signos].reverse().find(x=>sameC(x.cuenta,c.cuenta)),co=S.consultas.find(x=>sameC(x.cuenta,c.cuenta)),rx=S.prescripciones.filter(x=>sameC(x.cuenta,c.cuenta));
++ const head=`<p><b>${esc(c.paciente)}</b> · DNI ${esc(c.dni)} · HC ${esc(c.hc||'—')}${p.nacimiento?' · '+edad(p.nacimiento)+' años':''} · ${tag(c.seguro||'—','b')}<br>Cuenta <b>${c.cuenta}</b> · ${esc(c.especialidad)} · ${esc(c.medico)} · ${c.fecha} ${c.hora}</p>`,
++ tri=sg?`<p><b>Triaje:</b> PA ${esc(sg.pa||'–')} · FC ${sg.fc??'–'} · FR ${sg.fr??'–'} · T° ${sg.temp??'–'} · SpO₂ ${sg.spo2??'–'} · ${sg.peso??'–'} kg · ${sg.talla??'–'} cm</p>`:'<p class="mut">Sin triaje registrado.</p>',
++ cuerpo=co?`<div class="res g"><b>Atención registrada (${esc(co.por||'')})</b><br>Motivo: ${esc(co.motivo)}<br>Diagnóstico: ${esc(co.diagnostico)}${co.cie?' ('+esc(co.cie)+')':''}${co.plan?'<br>Plan: '+esc(co.plan):''}${co.indic?'<br>Indicaciones: '+esc(co.indic):''}</div>`
++  :is('admin','medico')?`<form data-f="consulta">${f('Motivo de consulta','motivo','text','required')}${ta('Enfermedad actual','relato')}${ta('Examen clínico','examen')}${f('Diagnóstico','diagnostico','text','required')}${f('CIE-10 (opcional)','cie','text','placeholder="J00" maxlength=8')}${ta('Plan / tratamiento','plan')}${ta('Indicaciones','indic')}<button class="btn">Guardar atención</button></form>`:'<p class="mut">Solo el médico registra la atención.</p>';
++ return card(`Atención · Cuenta ${c.cuenta}`,head+tri+cuerpo+(rx.length?`<p><b>Recetas:</b> ${rx.length} medicamento(s)</p>`:'')+`<p>${b('rx:go',c.cuenta,'Ir a recetas','o')}</p>`)}
++
++/* ---------- Recetas ---------- */
++function rxPanel(c){const p=pacDe(c.cuenta)||{},lista=S.prescripciones.filter(x=>sameC(x.cuenta,c.cuenta));
++ return `<div class="grid two">${card(`Receta · Cuenta ${c.cuenta}`,is('admin','medico')?`<form data-f="rx">${f('Medicamento','medicamento','text','required')}${f('Dosis','dosis','text','placeholder="500 mg"')}${f('Frecuencia','frecuencia','text','placeholder="cada 8 horas"')}${f('Días de tratamiento','dias','number','required min=1 max=365 value=5')}${f('Cantidad total','cantidad','number','required min=1 max=1000 value=15')}${f('Indicaciones','indic','text')}<button class="btn">Agregar a la receta</button></form>`:'<p class="mut">Solo el médico emite recetas.</p>')}
++ <div class="card"><h3>Vista de la receta</h3><div id="rxp" class="rxp"><h2 style="margin:0">✚ MediX-Core</h2><p><b>Paciente:</b> ${esc(c.paciente)} · DNI ${esc(c.dni)} · HC ${esc(c.hc||'—')}${p.nacimiento?' · '+edad(p.nacimiento)+' años':''}<br><b>Cuenta:</b> ${c.cuenta} · <b>Servicio:</b> ${esc(c.especialidad)} · <b>Médico:</b> ${esc(c.medico)} · <b>Fecha:</b> ${c.fecha}</p>
++ ${lista.length?`<ol>${lista.map(x=>`<li><b>${esc(x.medicamento)}</b> ${esc(x.dosis||'')} — ${esc(x.frecuencia||'')} por ${x.dias} día(s) · Cant. ${x.cantidad}${x.indic?'<br><small>'+esc(x.indic)+'</small>':''}</li>`).join('')}</ol>`:'<p class="mut">Aún no hay medicamentos en esta receta.</p>'}</div>
++ <p>${b('rx:print','','🖨 Imprimir','g')}</p></div></div>`}
++
++Object.assign(V,{
++ paciente:()=>{const e=S.pacientes.find(p=>p.id===PAC.edit)||{},v=k=>`value="${esc(e[k]||'')}"`;
++  return `<div class="grid two"><div>${card(PAC.edit?`Editar paciente · HC ${esc(e.hc)}`:'Nuevo paciente',`<form data-f="paciente">${f('DNI / documento','dni','text','required maxlength=12 '+v('dni'))}${f('Apellidos','apellidos','text','required '+v('apellidos'))}${f('Nombres','nombres','text','required '+v('nombres'))}${f('Fecha de nacimiento','nacimiento','date',`required max="${HOY()}" `+v('nacimiento'))}${sv('Sexo','sexo',[['M','Masculino'],['F','Femenino']],e.sexo)}${sv('Seguro','seguro',SEG,e.seguro)}${f('Teléfono','telefono','tel',v('telefono'))}${f('Dirección','direccion','text',v('direccion'))}<button class="btn">${PAC.edit?'Guardar cambios':'Registrar paciente'}</button></form>${PAC.edit?`<p>${b('pac:new','','Cancelar edición','g')}</p>`:''}`)}</div>
++  ${card('Pacientes',`<input id="pq" data-s="pac" placeholder="Buscar por DNI, HC o apellido…" value="${esc(PAC.q)}"><div id="pt" class="tw"></div>`)}</div>`},
++ admision,
++ trajereg:triajeReg,
++ atenc:()=>{const q=ATN.q,val=k=>`value="${esc(q[k]||'')}"`;
++  return `${card('Búsqueda',`<form data-f="busq" class="flt2">${f('N° cuenta','cuenta','text',val('cuenta'))}${f('N° DNI','dni','text',val('dni'))}${f('Hist. clínica','hc','text',val('hc'))}${f('Apell. paterno','apellido','text',val('apellido'))}${f('F. ingreso','fecha','date',val('fecha'))}${sv('Servicio','servicio',[['','Todos'],...uniq('especialidad')],q.servicio||'')}<div><button class="btn">Buscar</button> ${b('atn:clear','','Limpiar','g')}</div></form>`)}
++  ${card('Lista de admisiones',ATN.rows?tbl(['Fecha','Hora','Cuenta','HC','Paciente','DNI','Servicio','Médico','Estado',''],ATN.rows.map(c=>tr([c.fecha,c.hora,`<b>${c.cuenta??''}</b>`,esc(c.hc||''),esc(c.paciente),esc(c.dni||''),esc(c.especialidad||''),esc(c.medico),estTag(c.estado),b('atn:sel',c.cuenta,'Abrir')]))):'<p class="mut">Usa los filtros y pulsa Buscar.</p>')}
++  ${ATN.sel?atPanel():''}`},
++ rx:()=>{const c=RX.cuenta&&cuentaDe(RX.cuenta);
++  return `${card('Buscar cuenta',`<form data-f="rxbusca">${f('N° de cuenta','cuenta','text','required inputmode=numeric')}<button class="btn">Abrir</button></form>`)}${c?rxPanel(c):''}`},
++ prog:()=>`<div class="grid two">${is('admin')?card('Nueva programación',`<form data-f="prog">${f('Médico','medico','text','required minlength=3')}${f('Especialidad','especialidad','text','required list=dle')}<datalist id="dle">${uniq('especialidad').map(x=>`<option value="${esc(x)}">`).join('')}</datalist>${f('Consultorio','consultorio','text','required')}${f('Hora de inicio','hi','time','required value="08:00"')}${f('Hora de fin','hf','time','required value="12:00"')}${f('Minutos por cita','dur','number','required min=5 max=120 value=15')}<p>Días de atención:</p>${[1,2,3,4,5,6,0].map(d=>`<label class="chk"><input type="checkbox" name="d" value="${d}" ${d>=1&&d<=5?'checked':''}>${DIAS[d]}</label>`).join('')}<button class="btn">Guardar</button></form>`):card('Programación','<p class="mut">Solo administración modifica la programación de médicos.</p>')}
++  ${card('Médicos programados',tbl(['Médico','Servicio','Consultorio','Turno','Min','Días',''],S.programacion.map(p=>tr([esc(p.medico),esc(p.especialidad),esc(p.consultorio),`${p.hi}–${p.hf}`,p.dur,diasTxt(p),is('admin')?b('del:programacion',p.id,'Eliminar','r'):'']))))}</div>`
++});
++Object.assign(F,{
++ paciente:async d=>{const body={...d,dni:d.dni.trim().toUpperCase()};
++  if(PAC.edit){await api('PUT','/pacientes/'+PAC.edit,body);toast('Paciente actualizado');PAC.edit=null}
++  else{const r=await api('POST','/pacientes',body);toast('Paciente registrado · HC '+r.hc)}},
++ asignar:async d=>{const dni=String(d.pac).split(' · ')[0].trim().toUpperCase(),p=S.pacientes.find(x=>x.dni===dni);
++  if(!p){toast('Elige un paciente registrado de la lista','err');throw 0}
++  const r=await api('POST','/agenda/asignar',{prog:AD.prog,fecha:AD.fecha,hora:AD.slot,pid:p.id,seguro:d.seguro||p.seguro});
++  toast(`Cita asignada · N° de cuenta ${r.cuenta}`);AD.slot=null;await refreshAD()},
++ signos:async d=>{const o={cuenta:+TG.cuenta};if(d.pa&&d.pa.trim())o.pa=d.pa.trim();
++  for(const k of['fc','fr','temp','spo2','peso','talla'])if(d[k]!=='')o[k]=+d[k];
++  await api('POST','/signos',o);toast('Triaje registrado');TG.cuenta=null},
++ busq:async d=>{ATN.q=d;await buscar()},
++ consulta:async d=>{const o={cuenta:+ATN.sel};for(const[k,v]of Object.entries(d))if(v.trim())o[k]=v.trim();
++  await api('POST','/consultas',o);toast('Atención registrada');if(ATN.rows)await buscar()},
++ rxbusca:d=>{const c=cuentaDe(d.cuenta.trim());if(!c){toast('No existe esa cuenta','err');throw 0}RX.cuenta=c.cuenta},
++ rx:async d=>{const o={cuenta:+RX.cuenta,medicamento:d.medicamento.trim(),dias:+d.dias,cantidad:+d.cantidad};
++  for(const k of['dosis','frecuencia','indic'])if(d[k].trim())o[k]=d[k].trim();
++  await api('POST','/prescripciones',o);toast('Medicamento agregado a la receta')},
++ prog:async(d,e)=>{const dias=[...e.target.querySelectorAll('[name=d]:checked')].map(x=>x.value).join(',');
++  await api('POST','/programacion',{medico:d.medico.trim(),especialidad:d.especialidad.trim(),consultorio:d.consultorio.trim(),hi:d.hi,hf:d.hf,dur:+d.dur,dias});toast('Programación guardada')}
++});
++Object.assign(A,{
++ 'pac:edit':id=>{PAC.edit=id},'pac:new':()=>{PAC.edit=null},
++ 'ad:prog':async id=>{AD.prog=id;AD.fecha=null;AD.slot=null;await refreshAD()},
++ 'ad:mes':async id=>{const[y,m]=AD.mes.split('-').map(Number),d=new Date(Date.UTC(y,m-1+ +id,1));AD.mes=d.toISOString().slice(0,7);AD.fecha=null;AD.slot=null;await refreshAD()},
++ 'ad:dia':async id=>{AD.fecha=id;AD.slot=null;await refreshAD()},
++ 'ad:slot':id=>{AD.slot=id},
++ 'ad:clear':()=>{AD.fmed='';AD.fcons=''},
++ 'ad:prox':async()=>{const r=await api('GET','/agenda/proximo'+(AD.prog?'?prog='+AD.prog:''));
++  if(!r.fecha){toast('No hay cupos disponibles próximamente','err');return}
++  AD.prog=r.prog;AD.fecha=r.fecha;AD.mes=r.fecha.slice(0,7);AD.slot=r.hi;await refreshAD()},
++ 'ad:estado':async(id,v)=>{await api('PUT','/citas/'+id,{estado:v});await refreshAD()},
++ 'tg:sel':c=>{TG.cuenta=c},
++ 'atn:clear':()=>{ATN.q={fecha:HOY()};ATN.rows=null;ATN.sel=null},
++ 'atn:sel':c=>{ATN.sel=c},
++ 'rx:go':c=>{RX.cuenta=c;tab='rx'},
++ 'rx:print':()=>{window.print()}
++});
++const C={'ad:fmed':v=>{AD.fmed=v},'ad:fcons':v=>{AD.fcons=v}};
++document.addEventListener('change',async e=>{const t=e.target.closest('[data-c]');if(!t)return;try{await C[t.dataset.c](t.value);await load()}catch{}});
+ document.addEventListener('click',async e=>{const t=e.target.closest('[data-a]');if(!t||t.dataset.a=='q')return;if(!ac)try{ac=new AudioContext}catch{}
+  const a=t.dataset.a;try{if(a.startsWith('del:')){await api('DELETE','/'+a.slice(4)+'/'+t.dataset.id)}else{const r=A[a](t.dataset.id,t.dataset.v);if(r&&r.then)await r;if(['tab','star','screen','next'].includes(a))return}await load()}catch{}});
+-document.addEventListener('input',e=>{if(e.target.dataset.a=='q')dirList()});
++document.addEventListener('input',e=>{if(e.target.dataset.a=='q')dirList();if(e.target.dataset.s=='pac'){PAC.q=e.target.value;pacList()}});
+ document.addEventListener('submit',async e=>{e.preventDefault();const k=e.target.dataset.f;if(!k)return;try{await F[k](Object.fromEntries(new FormData(e.target)),e);e.target.reset();await load()}catch(x){if(x=='local')return}});
+ setInterval(()=>{$('#clk').textContent=new Date().toLocaleString('es-PE',{dateStyle:'full',timeStyle:'short'})},1000);
+-setInterval(async()=>{const x=document.activeElement;if(x&&/INPUT|SELECT|TEXTAREA/.test(x.tagName))return;try{S=await api('GET','');announce();draw()}catch{}},4000);
++setInterval(async()=>{const x=document.activeElement;if(x&&/INPUT|SELECT|TEXTAREA/.test(x.tagName))return;try{S=await api('GET','');if(tab=='admision')await refreshAD();announce();draw()}catch{}},4000);
+ setInterval(()=>{const h=HM();(S.recetas||[]).forEach(r=>{const k=r.id+HOY()+h;if(r.hora==h&&!alerted[k]){alerted[k]=1;toast(`💊 ${r.paciente}: tomar ${r.medicamento} ${r.dosis||''}`);beep(3)}})},15000);
+ load().catch(()=>{});
+ </script></body></html>
+diff --git a/server.js b/server.js
+index a901b14..745b233 100644
+--- a/server.js
++++ b/server.js
+@@ -1,8 +1,10 @@
+ // MediX-Core · servidor sin dependencias (node server.js). Datos en memoria + respaldo en data.json (sustituye a la BD por ahora).
+ const http=require('http'),fs=require('fs'),path=require('path'),crypto=require('crypto');
++const AG=require('./lib/agenda');
+ const PORT=process.env.PORT||3000,FILE=path.join(__dirname,'data.json'),PUB=path.join(__dirname,'public');
+ const uid=()=>crypto.randomBytes(4).toString('hex'),D=new Date(Date.now()-new Date().getTimezoneOffset()*6e4).toISOString().slice(0,10);
+-const seed=()=>({meta:{n:0},triajes:[],turnos:[],recetas:[{id:uid(),paciente:'Rosa Quispe',tel:'51999111222',medicamento:'Metformina',dosis:'850 mg',hora:'08:00'}],
++const PROG=[['Dra. Marta Ríos','Obstetricia','Consultorio 105','08:00','12:00',15,'1,2,3,4,5'],['Dra. Ana Torres','Medicina General','Consultorio 101','08:00','12:00',15,'1,2,3,4,5'],['Dr. Carlos Vega','Cardiología','Consultorio 102','08:00','12:00',20,'1,3,5'],['Dra. Lucía Paz','Pediatría','Consultorio 103','14:00','18:00',20,'2,4'],['Dr. Jorge Soto','Cirugía','Consultorio 104','09:00','13:00',30,'1,2,3,4,5']].map(([medico,especialidad,consultorio,hi,hf,dur,dias])=>({id:uid(),medico,especialidad,consultorio,hi,hf,dur,dias}));
++const seed=()=>({meta:{n:0,cuenta:1000},programacion:PROG,triajes:[],turnos:[],recetas:[{id:uid(),paciente:'Rosa Quispe',tel:'51999111222',medicamento:'Metformina',dosis:'850 mg',hora:'08:00'}],
+ citas:[{id:uid(),paciente:'Luis Ramos',medico:'Dra. Ana Torres',fecha:D,hora:'09:00',estado:'Programada'},{id:uid(),paciente:'Marta Díaz',medico:'Dr. Carlos Vega',fecha:D,hora:'10:30',estado:'Programada'}],
+ stock:[['Gasas estériles',120,50],['Jeringas 5 ml',30,60],['Guantes de látex (par)',400,150],['Alcohol 70% (L)',12,10]].map(([nombre,cantidad,minimo])=>({id:uid(),nombre,cantidad,minimo})),
+ equipos:[['Ecógrafo portátil','EQ-001','Emergencias'],['Monitor de signos vitales','EQ-002','UCI'],['Desfibrilador','EQ-003','Sin asignar']].map(([nombre,codigo,asignado])=>({id:uid(),nombre,codigo,asignado})),
+@@ -10,22 +12,53 @@ camas:Array.from({length:12},(_,i)=>({id:uid(),num:String(101+i),estado:i%5==0?'
+ visitas:[],asistencia:[],encuestas:[],reservas:[],
+ directorio:[['Dra. Ana Torres','Medicina General','101','a.torres@medix.pe','MD001'],['Dr. Carlos Vega','Cardiología','102','c.vega@medix.pe','MD002'],['Dra. Lucía Paz','Pediatría','103','l.paz@medix.pe','MD003'],['Dr. Jorge Soto','Cirugía','104','j.soto@medix.pe','MD004'],['Lic. Elena Ruiz','Enfermería','105','e.ruiz@medix.pe','EN001']].map(([nombre,especialidad,anexo,correo,codigo])=>({id:uid(),nombre,especialidad,anexo,correo,codigo}))});
+ let db;try{db=JSON.parse(fs.readFileSync(FILE))}catch{db=seed()}
++db.meta=db.meta||{n:0};db.meta.cuenta=db.meta.cuenta??1000;if(!Array.isArray(db.programacion))db.programacion=PROG;
++for(const k of['pacientes','signos','consultas','prescripciones'])if(!Array.isArray(db[k]))db[k]=[];db.meta.hc=db.meta.hc??0;
+ let tm;const save=()=>{clearTimeout(tm);tm=setTimeout(()=>fs.writeFile(FILE,JSON.stringify(db,null,1),()=>{}),300)};
++const cuentaOk=o=>db.citas.some(x=>x.cuenta!=null&&String(x.cuenta)===String(o.cuenta));
+ const chk=(c,o,id)=>{
++ if(c==='pacientes'){const dni=String(o.dni||'').trim().toUpperCase(),n=String(o.nombres||'').trim(),a=String(o.apellidos||'').trim();
++  if(!/^[A-Z0-9]{8,12}$/.test(dni))return'El documento debe tener entre 8 y 12 letras o números';
++  if(n.length<2||a.length<2)return'Ingresa nombres y apellidos';
++  if(o.nacimiento&&(!AG.validDate(o.nacimiento)||o.nacimiento>AG.localNow().fecha))return'Fecha de nacimiento inválida';
++  if(!['M','F'].includes(o.sexo))return'Selecciona el sexo';
++  if(!AG.SEGUROS.includes(o.seguro))return'Selecciona el tipo de seguro';
++  if(db.pacientes.some(x=>x.id!==id&&x.dni===dni))return'Ya existe un paciente con ese documento';
++  o.dni=dni}
++ if(c==='signos'){if(!cuentaOk(o))return'No existe la cuenta indicada';
++  const rg=(v,lo,hi)=>v===undefined||v===''||(typeof v==='number'&&v>=lo&&v<=hi);
++  if(!['pa','fc','fr','temp','spo2','peso','talla'].some(k=>o[k]!==undefined&&o[k]!==''))return'Registra al menos un signo vital';
++  if(o.pa&&!/^\d{2,3}\/\d{2,3}$/.test(o.pa))return'Presión arterial con formato 120/80';
++  if(!rg(o.fc,20,300)||!rg(o.fr,4,80)||!rg(o.temp,25,45)||!rg(o.spo2,0,100)||!rg(o.peso,0.3,500)||!rg(o.talla,20,260))return'Algún signo vital está fuera de rango'}
++ if(c==='consultas'){if(!cuentaOk(o))return'No existe la cuenta indicada';
++  if(db.consultas.some(x=>String(x.cuenta)===String(o.cuenta)))return'Esta cuenta ya tiene una atención registrada';
++  if(String(o.motivo||'').trim().length<3)return'Ingresa el motivo de consulta';
++  if(String(o.diagnostico||'').trim().length<3)return'Ingresa el diagnóstico';
++  if(o.cie&&!/^[A-Za-z]\d{2}(\.\d{1,2})?$/.test(o.cie))return'Código CIE-10 inválido (ej. J00 u O80.0)'}
++ if(c==='prescripciones'){if(!cuentaOk(o))return'No existe la cuenta indicada';
++  if(String(o.medicamento||'').trim().length<2)return'Indica el medicamento';
++  if(!Number.isInteger(o.dias)||o.dias<1||o.dias>365)return'Los días de tratamiento deben ser de 1 a 365';
++  if(!Number.isInteger(o.cantidad)||o.cantidad<1||o.cantidad>1000)return'La cantidad debe ser de 1 a 1000'}
+  if(c==='reservas'){if(o.fin<=o.inicio)return'La hora de fin debe ser posterior al inicio';if(db.reservas.some(r=>r.id!==id&&r.sala===o.sala&&r.fecha===o.fecha&&r.inicio<o.fin&&o.inicio<r.fin))return'La sala ya está reservada en ese horario'}
++ if(c==='programacion')return AG.validarProgramacion(o);
++ if(c==='citas'&&o.estado!=='Cancelada'){const e=AG.validarCita(db,o,id,undefined,{past:!id});if(e)return e}
+  if(c==='citas'&&o.estado!=='Cancelada'&&db.citas.some(x=>x.id!==id&&x.estado!=='Cancelada'&&x.medico===o.medico&&x.fecha===o.fecha&&x.hora===o.hora))return'El médico ya tiene una cita en ese horario'};
+ const HOST=process.env.HOST||'127.0.0.1',PROXY=process.env.TRUST_PROXY==='1',SECURE=process.env.SECURE==='1';
+ const SEC={'X-Content-Type-Options':'nosniff','X-Frame-Options':'DENY','Referrer-Policy':'no-referrer','Cross-Origin-Resource-Policy':'same-origin','Content-Security-Policy':"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"};
+ const J=(r,s,o,h)=>{r.writeHead(s,{'Content-Type':'application/json','Cache-Control':'no-store',...SEC,...h});r.end(JSON.stringify(o))};
+ const MIME={'.html':'text/html; charset=utf-8','.js':'text/javascript','.css':'text/css','.svg':'image/svg+xml','.png':'image/png'};
+ // ---- Seguridad: usuarios, roles, sesiones, límites ----
+-const W={admin:'*',medico:['citas','recetas','camas','reservas','stock','equipos','triajes','turnos','encuestas'],recepcion:['citas','turnos','visitas','triajes','encuestas','recetas'],seguridad:['visitas','asistencia']};
++const W={admin:'*',medico:['citas','recetas','camas','reservas','stock','equipos','triajes','turnos','encuestas','pacientes','signos','consultas','prescripciones'],recepcion:['citas','turnos','visitas','triajes','encuestas','recetas','pacientes'],enfermeria:['citas','pacientes','signos','camas','stock'],seguridad:['visitas','asistencia']};
++// Quién puede LEER los datos clínicos / de pacientes (el resto recibe listas vacías) y qué registros son de solo-añadir.
++const RD={pacientes:['admin','medico','recepcion','enfermeria'],signos:['admin','medico','enfermeria'],consultas:['admin','medico'],prescripciones:['admin','medico','enfermeria']};
++const APP=new Set(['signos','consultas','prescripciones']);
++const view=r=>{const o={...db};for(const[k,v]of Object.entries(RD))if(!v.includes(r))o[k]=[];return o};
+ const UF=path.join(__dirname,'users.json');let users;try{users=JSON.parse(fs.readFileSync(UF))}catch{users=[]}
+ const saveU=()=>fs.writeFileSync(UF,JSON.stringify(users,null,1),{mode:0o600});
+ const hash=(p,s=crypto.randomBytes(16).toString('hex'))=>s+':'+crypto.scryptSync(p,s,64).toString('hex');
+ const verify=(p,h)=>{const[s,k]=h.split(':'),a=Buffer.from(k,'hex'),c=crypto.scryptSync(p,s,64);return a.length===c.length&&crypto.timingSafeEqual(a,c)};
+ const DUMMY=hash('dummy-password');
+-if(process.argv[2]==='adduser'){const[n,r,pw]=process.argv.slice(3);if(!/^[\w.-]{3,30}$/.test(n||'')||!W[r]){console.log('Uso: node server.js adduser <usuario> <admin|medico|recepcion|seguridad> [clave]');process.exit(1)}
++if(process.argv[2]==='adduser'){const[n,r,pw]=process.argv.slice(3);if(!/^[\w.-]{3,30}$/.test(n||'')||!W[r]){console.log('Uso: node server.js adduser <usuario> <admin|medico|enfermeria|recepcion|seguridad> [clave]');process.exit(1)}
+  const p=pw||crypto.randomBytes(9).toString('base64url');if(p.length<10){console.log('La clave debe tener 10 o más caracteres');process.exit(1)}
+  users=users.filter(x=>x.u!==n);users.push({u:n,role:r,h:hash(p)});saveU();console.log(`Usuario ${n} (${r}) listo. Clave: ${p}`);process.exit(0)}
+ let first=null;if(!users.length){first=crypto.randomBytes(9).toString('base64url');users.push({u:'admin',role:'admin',h:hash(first)});saveU()}
+@@ -36,7 +69,7 @@ const cookie=q=>Object.fromEntries((q.headers.cookie||'').split(';').map(c=>c.tr
+ const who=q=>{const s=ses.get(cookie(q).mx);return s&&s.exp>Date.now()?s:null};
+ const audit=(u,ip,a)=>fs.appendFile(path.join(__dirname,'audit.log'),`${new Date().toISOString()} ${u} ${ip} ${a}\n`,()=>{});
+ const clean=o=>{const r={};for(const[k,v]of Object.entries(o)){if(!/^[a-z_]{1,24}$/i.test(k)||['__proto__','constructor','prototype','id','ts'].includes(k))continue;
+- if(typeof v==='string')r[k]=v.slice(0,300);else if((typeof v==='number'&&isFinite(v))||typeof v==='boolean')r[k]=v}return r};
++ if(typeof v==='string')r[k]=v.slice(0,/^(relato|examen|plan|indic|nota|obs)/.test(k)?2000:300);else if((typeof v==='number'&&isFinite(v))||typeof v==='boolean')r[k]=v}return r};
+ const server=http.createServer((req,res)=>{
+  const ip=(PROXY&&(req.headers['x-forwarded-for']||'').split(',')[0].trim())||req.socket.remoteAddress;
+  if(!rl('g'+ip,600,6e4))return J(res,429,{error:'Demasiadas solicitudes. Espera un momento.'},{'Retry-After':'60'});
+@@ -61,7 +94,17 @@ const server=http.createServer((req,res)=>{
+    if(id==='me'){const s=who(req);return s?J(res,200,{u:s.u,role:s.role}):J(res,401,{error:'Sin sesión'})}
+    return J(res,404,{error:'No encontrado'})}
+   const s=who(req);if(!s)return J(res,401,{error:'Inicia sesión',code:'AUTH'});
+-  if(M==='GET'&&!col)return J(res,200,db);
++  if(M==='GET'&&!col)return J(res,200,view(s.role));
++  if(col==='agenda'){
++   const q=Object.fromEntries(u.searchParams),prog=db.programacion.find(x=>x.id===q.prog);
++   if(M==='GET'&&id==='calendario'){if(!prog)return J(res,404,{error:'Programación no encontrada'});if(!AG.validMonth(q.mes))return J(res,400,{error:'Mes inválido (AAAA-MM)'});return J(res,200,{dias:AG.calendario(db,prog,q.mes)})}
++   if(M==='GET'&&id==='franjas'){if(!prog)return J(res,404,{error:'Programación no encontrada'});if(!AG.validDate(q.fecha))return J(res,400,{error:'Fecha inválida'});return J(res,200,AG.franjas(db,prog,q.fecha))}
++   if(M==='GET'&&id==='proximo'){const l=db.programacion.filter(x=>(!q.especialidad||x.especialidad===q.especialidad)&&(!q.prog||x.id===q.prog));return J(res,200,AG.proximo(db,l)||{})}
++   if(M==='GET'&&id==='atenciones'){if(!RD.pacientes.includes(s.role))return J(res,403,{error:'Tu rol no tiene permiso para ver esto'});const t=v=>String(v||'').trim().toLowerCase(),r=db.citas.filter(c=>c.estado!=='Cancelada'&&(!q.cuenta||String(c.cuenta)===q.cuenta.trim())&&(!q.hc||String(c.hc)===q.hc.trim())&&(!q.dni||t(c.dni)===t(q.dni))&&(!q.apellido||t(c.paciente).includes(t(q.apellido)))&&(!q.fecha||c.fecha===q.fecha)&&(!q.servicio||c.especialidad===q.servicio));
++    return J(res,200,r.sort((a,b)=>(a.fecha+a.hora).localeCompare(b.fecha+b.hora)).slice(0,200))}
++   if(M==='POST'&&id==='asignar'){if(W[s.role]!=='*'&&!W[s.role].includes('citas'))return J(res,403,{error:'Tu rol no tiene permiso para modificar esto'});
++    const r=AG.asignar(db,b,{id:uid()});if(r.error)return J(res,r.status,{error:r.error});audit(s.u,ip,`ASIGNAR cita ${r.cita.cuenta}`);save();return J(res,201,r.cita)}
++   return J(res,404,{error:'No encontrado'})}
+   if(!Array.isArray(db[col]))return J(res,404,{error:'Colección no encontrada'});
+   if(M!=='GET'&&W[s.role]!=='*'&&!W[s.role].includes(col))return J(res,403,{error:'Tu rol no tiene permiso para modificar esto'});
+   if(M!=='GET')audit(s.u,ip,`${M} ${u.pathname}`);
+@@ -70,9 +113,17 @@ const server=http.createServer((req,res)=>{
+   b=clean(b);
+   if(M==='POST'){const o={...b,id:uid(),ts:Date.now()};
+    if(col==='turnos'){o.num='A-'+String(++db.meta.n).padStart(3,'0');o.estado='espera'}
+-   const e=chk(col,o);if(e)return J(res,409,{error:e});db[col].push(o);save();return J(res,201,o)}
++   const e=chk(col,o);if(e)return J(res,409,{error:e});
++   if(col==='pacientes')o.hc=String(++db.meta.hc).padStart(6,'0');
++   if(APP.has(col)){o.por=s.u;const c=db.citas.find(x=>String(x.cuenta)===String(o.cuenta));
++    if(c&&col==='signos'&&['Programada','Admitida'].includes(c.estado))c.estado='Triada';
++    if(c&&col==='consultas')c.estado='Atendida'}
++   db[col].push(o);save();return J(res,201,o)}
+   const i=db[col].findIndex(x=>x.id===id);if(i<0)return J(res,404,{error:'No existe'});
+-  if(M==='PUT'){const o={...db[col][i],...b,id};const e=chk(col,o,id);if(e)return J(res,409,{error:e});db[col][i]=o;save();return J(res,200,o)}
++  if(APP.has(col)&&M!=='GET')return J(res,405,{error:'Los registros clínicos no se modifican ni se eliminan'});
++  if(col==='pacientes'&&M==='DELETE')return J(res,405,{error:'Los pacientes no se eliminan'});
++  if(M==='PUT'){const o={...db[col][i],...b,id};if(col==='pacientes')o.hc=db[col][i].hc;const e=chk(col,o,id);if(e)return J(res,409,{error:e});db[col][i]=o;save();return J(res,200,o)}
++  if(M==='DELETE'&&col==='programacion'&&db.citas.some(c=>c.prog===id&&c.estado!=='Cancelada'))return J(res,409,{error:'El médico tiene citas asignadas; cancélalas primero'});
+   if(M==='DELETE'){db[col].splice(i,1);save();return J(res,200,{ok:1})}
+   J(res,405,{error:'Método no permitido'})})
+ });

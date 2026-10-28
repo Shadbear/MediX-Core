@@ -1,0 +1,12 @@
+node_modules/
+.env
+data/
+*.db
+*.db-wal
+*.db-shm
+*.log
+data.json
+users.json
+audit.log
+node_modules
+
