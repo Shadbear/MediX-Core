@@ -1,0 +1,54 @@
+{
+  "name": "medix-core",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Sistema hospitalario simple y seguro: Node + SQLite, sin servidor de base de datos.",
+  "main": "main.js",
+  "engines": {
+    "node": ">=20.12"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test test/*.test.js",
+    "reset-password": "node scripts/reset-password.js",
+    "desktop": "electron .",
+    "build": "electron-builder"
+  },
+  "build": {
+    "appId": "com.medix.core",
+    "productName": "MedIX-Core",
+    "directories": {
+      "output": "dist"
+    },
+    "win": {
+      "target": "nsis",
+      "icon": "MedIX Core Logo.ico"
+    },
+    "npmRebuild": false,
+    "files": [
+      "**/*",
+      "!node_modules/*",
+      "node_modules/better-sqlite3/**/*",
+      "node_modules/bindings/**/*",
+      "node_modules/file-uri-to-path/**/*",
+      "node_modules/express/**/*",
+      "node_modules/bcryptjs/**/*",
+      "node_modules/helmet/**/*",
+      "node_modules/zod/**/*",
+      "node_modules/express-rate-limit/**/*"
+    ]
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "better-sqlite3": "^13.0.3",
+    "express": "^5.2.1",
+    "express-rate-limit": "^8.7.0",
+    "helmet": "^8.3.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "electron": "^45.2.1",
+    "electron-builder": "^26.18.0"
+  }
+}
